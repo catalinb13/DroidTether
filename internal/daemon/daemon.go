@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -43,12 +44,34 @@ func (d *Daemon) Run() error {
 
 	watcher := usb.NewWatcher(pollInterval)
 
+	// Serialize device sessions. OnAttach fires from the watcher's poll loop and
+	// previously did no bookkeeping, so a dying session's USB claim was still
+	// held when the next attach arrived. The new session then failed for ~8s
+	// with "libusb: bad access [code -3]" before the old one finished cleaning
+	// up, and each retry armed another watchdog. One session at a time; a new
+	// attach waits for the previous one to finish releasing the device.
+	var sessionMu sync.Mutex
+
 	watcher.OnAttach(func(dev *usb.Device) {
+		sessionMu.Lock()
+		defer sessionMu.Unlock()
+
 		d.wg.Add(1)
 		defer d.wg.Done()
 		log.Info().
 			Str("component", "daemon").
 			Msg("Android RNDIS device connected!")
+
+		// Always release the USB interfaces this session claimed. Without
+		// this, a relay that ends on a libusb error path leaves the claim
+		// dangling and the next attach cannot claim the interface.
+		defer func() {
+			if err := dev.Close(); err != nil {
+				log.Warn().Str("component", "daemon").Err(err).Msg("Failed to close USB device")
+			} else {
+				log.Debug().Str("component", "daemon").Msg("USB device released")
+			}
+		}()
 
 		session := rndis.NewSession(dev)
 		phoneMAC, err := session.Handshake()
@@ -63,12 +86,21 @@ func (d *Daemon) Run() error {
 			return
 		}
 
+		// Session-scoped context: the config watchdog must stop when this
+		// device session ends, not linger across reconnects.
+		sessionCtx, cancelSession := context.WithCancel(watcher.Context())
+		defer cancelSession()
+
 		// Ensure everything closes when watcher is stopped
 		go func() {
 			<-watcher.Context().Done()
 			iface.Close()
 		}()
 		defer iface.Close()
+
+		// The watchdog is started once per session; DHCP renewals may re-fire
+		// OnDHCP, but the watchdog must not stack.
+		var watchdogStarted sync.Once
 
 		relay, err := NewRelay(watcher.Context(), dev, iface, phoneMAC)
 		if err != nil {
@@ -97,11 +129,26 @@ func (d *Daemon) Run() error {
 						log.Warn().Str("component", "daemon").Err(err).Msg("Failed to set default route")
 					}
 
+					// Make droidtether a real configd service so the
+					// primary election picks it and the derived DNS
+					// resolver gets RequestA (mDNSResponder otherwise
+					// suppresses every A/AAAA query).
+					if err := iface.RegisterService(client, gateway); err != nil {
+						log.Warn().Str("component", "daemon").Err(err).Msg("Failed to register service with configd")
+					}
+
 					// Set DNS to Google (Primary) and phone gateway (Secondary)
 					log.Info().Str("component", "daemon").Msg("Setting system DNS to 8.8.8.8 (Google)...")
 					if err := iface.SetDNS([]string{"8.8.8.8", gateway}); err != nil {
 						log.Warn().Str("component", "daemon").Err(err).Msg("Failed to set DNS")
 					}
+
+					// macOS standby can silently remove everything we just
+					// injected while the USB session survives (no DHCP
+					// re-fire). Arm the watchdog that re-applies on drift.
+					watchdogStarted.Do(func() {
+						d.startConfigWatchdog(sessionCtx, iface, client, gateway, mtuStr)
+					})
 				}
 			}
 		}
