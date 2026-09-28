@@ -210,6 +210,13 @@ func (r *Relay) Start() error {
 								continue
 							}
 
+							// DHCP is the phone's own server answering us: its
+							// source MAC is authoritative for the tethering
+							// interface, so adopt it immediately (the 8-packet
+							// threshold never sees enough DHCP frames).
+							if isDHCPResponse(ethPkt) {
+								r.adoptMAC(ethPkt[6:12])
+							}
 							// Auto-detect phone's real MAC from received traffic.
 							// Samsung devices randomize the active MAC on the tethering
 							// interface, so the RNDIS-queried address may not match.
@@ -345,6 +352,41 @@ func (r *Relay) autoDetectMAC(srcMAC []byte) {
 		Str("new_mac", new).
 		Int("confirmed_packets", macAdoptThreshold).
 		Msg("Phone MAC change confirmed — switching destination MAC")
+}
+
+// isDHCPResponse reports whether an Ethernet frame carries a UDP 67→68
+// (server-to-client) DHCP message — the offer/ack that proves the sender is
+// the phone's own tethering interface.
+func isDHCPResponse(ethPkt []byte) bool {
+	if binary.BigEndian.Uint16(ethPkt[12:14]) != 0x0800 {
+		return false
+	}
+	rawIP := ethPkt[14:]
+	if len(rawIP) < 28 || rawIP[9] != 17 {
+		return false
+	}
+	return binary.BigEndian.Uint16(rawIP[20:22]) == 67 && binary.BigEndian.Uint16(rawIP[22:24]) == 68
+}
+
+// adoptMAC unconditionally re-points the relay's destination MAC to srcMAC
+// (skipping the consecutive-sighting threshold), used only when the frame is
+// self-authenticating evidence of the phone's tethering interface.
+func (r *Relay) adoptMAC(srcMAC []byte) {
+	r.mu.Lock()
+	if bytes.Equal(srcMAC, clientMAC) || bytes.Equal(srcMAC, r.phoneMAC) {
+		r.mu.Unlock()
+		return
+	}
+	old := hex.EncodeToString(r.phoneMAC)
+	r.macChanges++
+	copy(r.phoneMAC, srcMAC)
+	r.candMAC = nil
+	r.candCount = 0
+	r.mu.Unlock()
+	log.Warn().Str("component", "relay").
+		Str("old_mac", old).
+		Str("new_mac", hex.EncodeToString(srcMAC)).
+		Msg("Adopted phone MAC from DHCP response — destination re-pointed")
 }
 
 // isLoopFrame reports whether an inbound frame is our own traffic being
