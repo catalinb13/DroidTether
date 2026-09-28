@@ -172,3 +172,42 @@ func (d *Daemon) startConfigWatchdog(ctx context.Context, iface tun.Interface, l
 		}
 	}()
 }
+
+// startLinkWatchdog probes the phone's gateway through the tunnel. When
+// Android disables USB tethering (e.g. the phone screen locks), the phone
+// re-enumerates without the RNDIS config and the relay's writes to the
+// dead handle keep "succeeding" — the session becomes a zombie that holds
+// the watcher's active-device slot, so a later re-enable never re-attaches.
+// Three consecutive failed probes end the session; the watcher then sees
+// the device again (or waits for the user to re-enable tethering, covered
+// by the handshake-failure notification).
+func (d *Daemon) startLinkWatchdog(ctx context.Context, relay *Relay, gateway, client string) {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		fails := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := exec.Command("ping", "-c", "1", "-t", "3", "-S", client, gateway).Run()
+				if err == nil {
+					fails = 0
+					continue
+				}
+				fails++
+				if fails < 3 {
+					log.Warn().Str("component", "watchdog").
+						Int("fails", fails).
+						Msg("Gateway ping failed")
+					continue
+				}
+				log.Error().Str("component", "watchdog").
+					Msg("Phone left tethering state; ending zombie session")
+				relay.Stop()
+				return
+			}
+		}
+	}()
+}

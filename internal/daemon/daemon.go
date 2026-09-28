@@ -174,6 +174,7 @@ func (d *Daemon) Run() error {
 					// re-fire). Arm the watchdog that re-applies on drift.
 					watchdogStarted.Do(func() {
 						d.startConfigWatchdog(sessionCtx, iface, client, gateway, mtuStr)
+						go d.startLinkWatchdog(sessionCtx, relay, gateway, client)
 					})
 				}
 			}
