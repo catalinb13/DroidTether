@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +53,9 @@ func (d *Daemon) Run() error {
 	// up, and each retry armed another watchdog. One session at a time; a new
 	// attach waits for the previous one to finish releasing the device.
 	var sessionMu sync.Mutex
+	// Consecutive RNDIS handshake failures. Sessions are serialized by
+	// sessionMu, so a plain counter is enough.
+	var handshakeFails int
 
 	watcher.OnAttach(func(dev *usb.Device) {
 		sessionMu.Lock()
@@ -76,9 +81,30 @@ func (d *Daemon) Run() error {
 		session := rndis.NewSession(dev)
 		phoneMAC, err := session.Handshake()
 		if err != nil {
-			log.Error().Str("component", "daemon").Err(err).Msg("RNDIS Handshake failed")
+			handshakeFails++
+			log.Error().Str("component", "daemon").Err(err).
+				Int("consecutive", handshakeFails).
+				Msg("RNDIS Handshake failed")
+			// After a Mac sleep Android typically disables USB
+			// tethering itself: the phone still enumerates the RNDIS
+			// config but its gadget never answers INIT. Only the user
+			// can switch it back on, so tell them, and back off —
+			// the 1s reconnect storm against a surprise-removed
+			// device is what poisoned the libusb context (-99).
+			if handshakeFails == 5 {
+				go notifyPhoneTetheringOff()
+			}
+			backoff := time.Duration(handshakeFails) * 2 * time.Second
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			select {
+			case <-time.After(backoff):
+			case <-watcher.Context().Done():
+			}
 			return
 		}
+		handshakeFails = 0
 
 		iface, err := tun.OpenUTUN(0)
 		if err != nil {
@@ -198,6 +224,22 @@ func (d *Daemon) Run() error {
 	log.Info().Msg("Shutdown complete.")
 
 	return nil
+}
+
+// notifyPhoneTetheringOff shows a macOS user notification through the
+// console user's GUI session (the daemon runs as root). Best-effort:
+// every failure is ignored.
+func notifyPhoneTetheringOff() {
+	out, err := exec.Command("stat", "-f", "%u", "/dev/console").Output()
+	if err != nil {
+		return
+	}
+	uid := strings.TrimSpace(string(out))
+	if uid == "" || uid == "0" {
+		return
+	}
+	_ = exec.Command("launchctl", "asuser", uid, "osascript", "-e",
+		`display notification "USB tethering is disabled on the phone. Enable it in Settings → Network & internet → Hotspot & tethering → USB tethering." with title "DroidTether" sound name "Glass"`).Run()
 }
 
 func (d *Daemon) setupLogging() {
