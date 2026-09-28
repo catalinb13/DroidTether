@@ -92,7 +92,7 @@ func dnsIntact() bool {
 	if end := strings.Index(block, "resolver #2"); end >= 0 {
 		block = block[:end]
 	}
-	return strings.Contains(block, "8.8.8.8") && strings.Contains(block, "Request A records")
+	return strings.Contains(block, "1.1.1.1") && strings.Contains(block, "Request A records")
 }
 
 // ifaceConfigIntact reports whether the utun interface still holds the DHCP
@@ -165,7 +165,7 @@ func (d *Daemon) startConfigWatchdog(ctx context.Context, iface tun.Interface, l
 				if err := iface.RegisterService(localIP, gateway); err != nil {
 					log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-register service with configd")
 				}
-				if err := iface.SetDNS([]string{"8.8.8.8", gateway}); err != nil {
+				if err := iface.SetDNS([]string{"1.1.1.1", gateway}); err != nil {
 					log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-inject DNS")
 				}
 			}

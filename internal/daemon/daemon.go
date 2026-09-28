@@ -163,9 +163,11 @@ func (d *Daemon) Run() error {
 						log.Warn().Str("component", "daemon").Err(err).Msg("Failed to register service with configd")
 					}
 
-					// Set DNS to Google (Primary) and phone gateway (Secondary)
-					log.Info().Str("component", "daemon").Msg("Setting system DNS to 8.8.8.8 (Google)...")
-					if err := iface.SetDNS([]string{"8.8.8.8", gateway}); err != nil {
+					// Set DNS to Cloudflare (Primary) and phone gateway (Secondary).
+					// Cloudflare measured ~30ms faster than Google on this carrier
+					// (2026-09-28: dig 29ms vs 61ms, ping 35ms vs 51ms).
+					log.Info().Str("component", "daemon").Msg("Setting system DNS to 1.1.1.1 (Cloudflare)...")
+					if err := iface.SetDNS([]string{"1.1.1.1", gateway}); err != nil {
 						log.Warn().Str("component", "daemon").Err(err).Msg("Failed to set DNS")
 					}
 

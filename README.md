@@ -39,7 +39,7 @@ To trick macOS into waking up the browsers, simply **turn on your Mac's Wi-Fi**.
 #### **Native DNS Override (For CLI & App Store)**
 If Safari or CLI tools like `curl` still fail to resolve domains, force your DNS to route through the tunnel:
 ```bash
-sudo networksetup -setdnsservers Wi-Fi 8.8.8.8 8.8.4.4
+sudo networksetup -setdnsservers Wi-Fi 1.1.1.1 1.0.0.1
 ```
 *(To revert when done: `sudo networksetup -setdnsservers Wi-Fi empty`)*
 
