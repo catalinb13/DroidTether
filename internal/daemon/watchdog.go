@@ -22,6 +22,12 @@ import (
 // in place and re-applies whatever is missing. All checks are local
 // syscalls/commands (route/ifconfig/scutil) — zero carrier data.
 
+// A third failure mode is an orphaned DNS registration: a VPN helper that
+// exits without withdrawing its nameserver leaves configd electing a dead
+// resolver forever, so re-registering our own DNS every tick never wins. The
+// watchdog sweeps that orphan by signalling configd — but only when no live
+// tunnel is present, because a connected VPN owning DNS is intended behaviour.
+
 // routeIntact reports whether the split default routes (0.0.0.0/1 and
 // 128.0.0.0/1) are still installed on the given utun interface.
 //
@@ -75,7 +81,7 @@ func dnsIntact() bool {
 	cmd := exec.Command("scutil")
 	cmd.Stdin = strings.NewReader("show State:/Network/Global/IPv4\nquit\n")
 	out, err := cmd.Output()
-	if err != nil || !strings.Contains(string(out), "PrimaryService : droidtether") {
+	if err != nil {
 		return false
 	}
 
@@ -83,16 +89,85 @@ func dnsIntact() bool {
 	if err != nil {
 		return false
 	}
-	s := string(dns)
-	start := strings.Index(s, "resolver #1")
+	return dnsIntactFrom(string(out), string(dns))
+}
+
+// dnsIntactFrom holds the parsing logic, separated from the exec so it is
+// unit-testable.
+func dnsIntactFrom(globalIPv4, resolverList string) bool {
+	if !strings.Contains(globalIPv4, "PrimaryService : droidtether") {
+		return false
+	}
+	start := strings.Index(resolverList, "resolver #1")
 	if start < 0 {
 		return false
 	}
-	block := s[start:]
+	block := resolverList[start:]
 	if end := strings.Index(block, "resolver #2"); end >= 0 {
 		block = block[:end]
 	}
 	return strings.Contains(block, "1.1.1.1") && strings.Contains(block, "Request A records")
+}
+
+// dnsSweepAfterTicks is how many consecutive failed DNS checks — each already
+// followed by a re-registration — are tolerated before configd is asked to
+// rebuild its DNS registry. At the default 10s interval that is a one-minute
+// grace period for ordinary transient races (standby wake, interface churn).
+const dnsSweepAfterTicks = 6
+
+// dnsSweepCooldown throttles the sweep. When another service legitimately owns
+// DNS, re-signalling configd on every tick would be pure churn.
+const dnsSweepCooldown = 5 * time.Minute
+
+// liveTunnelFromIfconfig reports whether an interface other than ours is a
+// live tunnel: a utun-family interface that is not ours and holds an IPv4
+// lease. A connected VPN client (PIA, OpenVPN, WireGuard) owns the system DNS
+// by design and its resolver must be left alone; only a tunnel whose interface
+// is gone while its DNS registration stayed behind is an orphan. Idle
+// utun-family interfaces carry no inet address and do not count.
+func liveTunnelFromIfconfig(out, ourIface string) bool {
+	name := ""
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			name = strings.TrimSuffix(strings.Fields(line)[0], ":")
+			continue
+		}
+		if name == "" || name == ourIface || !strings.HasPrefix(name, "utun") {
+			continue
+		}
+		// "inet ", not "inet6": an IPv4 lease means the tunnel is up.
+		if strings.Contains(line, "inet ") {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldSweepDNS decides whether a DNS failure is a stuck election worth a
+// configd rebuild. Re-registration alone is not enough: a VPN that withdrew
+// its interface but not its resolver leaves configd electing the dead
+// nameserver indefinitely. liveTunnel suppresses the sweep while a real tunnel
+// is connected.
+func shouldSweepDNS(failStreak int, lastSweep, now time.Time, liveTunnel bool) bool {
+	if liveTunnel || failStreak < dnsSweepAfterTicks {
+		return false
+	}
+	if !lastSweep.IsZero() && now.Sub(lastSweep) < dnsSweepCooldown {
+		return false
+	}
+	return true
+}
+
+// sweepConfigDNS sends SIGHUP to configd so it rebuilds its DNS registry from
+// the live interfaces and preferences, dropping orphaned resolver registrations
+// so the service that is actually up wins the election again. `launchctl
+// kickstart -k system/com.apple.configd` is refused under SIP (rc 150); the
+// signal is permitted and configd stays up.
+func sweepConfigDNS() error {
+	return exec.Command("pkill", "-HUP", "configd").Run()
 }
 
 // ifaceConfigIntact reports whether the utun interface still holds the DHCP
@@ -119,6 +194,10 @@ func (d *Daemon) startConfigWatchdog(ctx context.Context, iface tun.Interface, l
 		Msg("Config watchdog started — will re-apply route/DNS/interface if macOS removes them (e.g. standby)")
 
 	go func() {
+		// dnsFailStreak counts failed DNS checks that a re-registration already
+		// followed; lastDNS is when the last orphan sweep signalled configd.
+		dnsFailStreak := 0
+		lastDNS := time.Time{}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -158,15 +237,38 @@ func (d *Daemon) startConfigWatchdog(ctx context.Context, iface tun.Interface, l
 				}
 			}
 
-			if !dnsIntact() {
+			if dnsIntact() {
+				dnsFailStreak = 0
+				continue
+			}
+
+			dnsFailStreak++
+			log.Warn().
+				Str("component", "watchdog").
+				Int("consecutive_dns_failures", dnsFailStreak).
+				Msg("DroidTether DNS resolver broken (primary election or RequestA lost) — re-registering service and re-injecting DNS...")
+			if err := iface.RegisterService(localIP, gateway); err != nil {
+				log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-register service with configd")
+			}
+			if err := iface.SetDNS([]string{"1.1.1.1", gateway}); err != nil {
+				log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-inject DNS")
+			}
+
+			// Re-registering did not win the election. When no other tunnel is
+			// actually up, the foreign nameserver we are losing to belongs to a
+			// VPN that withdrew its interface without withdrawing its resolver
+			// registration: sweep the orphan instead of spinning forever.
+			out, err := exec.Command("ifconfig", "-a").Output()
+			if err != nil {
+				continue
+			}
+			if shouldSweepDNS(dnsFailStreak, lastDNS, time.Now(), liveTunnelFromIfconfig(string(out), name)) {
+				lastDNS = time.Now()
 				log.Warn().
 					Str("component", "watchdog").
-					Msg("DroidTether DNS resolver broken (primary election or RequestA lost) — re-registering service and re-injecting DNS...")
-				if err := iface.RegisterService(localIP, gateway); err != nil {
-					log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-register service with configd")
-				}
-				if err := iface.SetDNS([]string{"1.1.1.1", gateway}); err != nil {
-					log.Error().Str("component", "watchdog").Err(err).Msg("Failed to re-inject DNS")
+					Msg("DNS election still stuck on a foreign nameserver with no live tunnel — orphaned resolver from a VPN that exited uncleanly; asking configd to rebuild its DNS registry (SIGHUP)...")
+				if err := sweepConfigDNS(); err != nil {
+					log.Error().Str("component", "watchdog").Err(err).Msg("Failed to signal configd")
 				}
 			}
 		}

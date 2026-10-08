@@ -14,6 +14,14 @@ Format:
 
 ---
 
+## Unreleased — local fixes on this Mac
+
+### 2026-10-08 16:50 — 🧹 Orphaned VPN DNS resolver sweep
+- What: The config watchdog now sends SIGHUP to configd after one minute of failed DNS re-registration, and only when no other tunnel holds an IPv4 lease.
+- Why: Private Internet Access closed its app but left its resolver (10.0.0.243, search domain `openvpn`) registered, so configd kept electing the dead nameserver and DroidTether's re-registration every 10s never won — tether alive, no name resolution.
+- Files: internal/daemon/watchdog.go, internal/daemon/watchdog_dnsorphan_test.go
+- Breaking: no
+
 ## v0.8.7 — 2026-05-04 (Current)
 
 ### 2026-05-04 18:30 — 🌐 Reachability API Bypass & MTU Fix
